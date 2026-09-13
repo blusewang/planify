@@ -204,15 +204,38 @@ public class Objects.Item : Objects.BaseObject {
         }
     }
 
+    string ? _extra_data_key = null;
+    Json.Object ? _extra_data_object = null;
+
+    private Json.Object ? get_extra_data_object () {
+        if (_extra_data_key != extra_data) {
+            _extra_data_object = Utils.JsonUtils.get_object (extra_data);
+            _extra_data_key = extra_data;
+        }
+
+        return _extra_data_object;
+    }
+
+    private string get_extra_data_member (string member) {
+        var json_object = get_extra_data_object ();
+
+        if (json_object != null && json_object.has_member (member) && !json_object.get_null_member (member)) {
+            return json_object.get_string_member (member);
+        }
+
+        return "";
+    }
+
     string _ical_url = "";
     public string ical_url {
         get {
-            var json_object = Utils.JsonUtils.get_object (extra_data);
+            var json_object = get_extra_data_object ();
 
-            if (json_object.has_member ("ics")) {
+            // Nothing writes "ics" any more; kept for databases written by older versions.
+            if (json_object != null && json_object.has_member ("ics")) {
                 _ical_url = "%s/%s".printf (project.calendar_url, json_object.get_string_member ("ics"));
             } else {
-                _ical_url = Utils.JsonUtils.get_string (extra_data, "ical_url");
+                _ical_url = get_extra_data_member ("ical_url");
             }
             return _ical_url;
         }
@@ -221,7 +244,7 @@ public class Objects.Item : Objects.BaseObject {
     string _calendar_data = "";
     public string calendar_data {
         get {
-            _calendar_data = Utils.JsonUtils.get_string (extra_data, "calendar-data");
+            _calendar_data = get_extra_data_member ("calendar-data");
             return _calendar_data;
         }
     }
@@ -229,7 +252,7 @@ public class Objects.Item : Objects.BaseObject {
     string _etag = "";
     public string etag {
         get {
-            _etag = Utils.JsonUtils.get_string (extra_data, "etag");
+            _etag = get_extra_data_member ("etag");
             return _etag;
         }
     }
@@ -629,6 +652,10 @@ public class Objects.Item : Objects.BaseObject {
 
         extra_data = Util.generate_extra_data (_ical_url, "", ical.as_ical_string ());
 
+        if (is_update) {
+            sync_reminders_from_vtodo (ical_vtodo);
+        }
+
         #if WITH_EVOLUTION
         ECal.Component ecal = new ECal.Component.from_icalcomponent (ical_vtodo);
 
@@ -650,6 +677,46 @@ public class Objects.Item : Objects.BaseObject {
             prop = component.get_next_property (ICal.PropertyKind.X_PROPERTY);
         }
         return null;
+    }
+
+    public void sync_reminders_from_vtodo (ICal.Component vtodo) {
+        var server_datetimes = new Gee.HashSet<string> ();
+
+        ICal.Component ? valarm = vtodo.get_first_component (ICal.ComponentKind.VALARM_COMPONENT);
+        while (valarm != null) {
+            ICal.Property ? trigger_prop = valarm.get_first_property (ICal.PropertyKind.TRIGGER_PROPERTY);
+            if (trigger_prop != null) {
+                ICal.Parameter ? value_param = trigger_prop.get_first_parameter (ICal.ParameterKind.VALUE_PARAMETER);
+                bool is_datetime = value_param != null && value_param.get_value () == ICal.ParameterValue.DATETIME;
+
+                if (is_datetime) {
+                    var trigger = trigger_prop.get_trigger ();
+                    if (trigger != null) {
+                        var trigger_time = trigger.get_time ();
+                        if (!trigger_time.is_null_time ()) {
+                            var dt = Utils.Datetime.ical_to_date_time_local (trigger_time);
+                            if (dt.compare (new GLib.DateTime.now_local ()) > 0) {
+                                server_datetimes.add (dt.to_string ());
+
+                                var reminder = new Objects.Reminder ();
+                                reminder.item_id = id;
+                                reminder.reminder_type = ReminderType.ABSOLUTE;
+                                reminder.due.date = dt.to_string ();
+                                add_reminder_if_not_exists (reminder, id != "");
+                            }
+                        }
+                    }
+                }
+            }
+            valarm = vtodo.get_next_component (ICal.ComponentKind.VALARM_COMPONENT);
+        }
+
+        foreach (var existing in reminders) {
+            if (existing.reminder_type == ReminderType.ABSOLUTE &&
+                !server_datetimes.contains (existing.datetime.to_string ())) {
+                existing.delete ();
+            }
+        }
     }
 
     private Gee.ArrayList<Objects.Label> get_caldav_categories (GLib.SList<string> categories_list) {
@@ -1447,11 +1514,35 @@ public class Objects.Item : Objects.BaseObject {
         child_order_property.set_x (child_order.to_string ());
         ical.add_property (child_order_property);
 
-        return "%s%s%s".printf (
+        var vtodo_string = ical.as_ical_string ();
+        var valarms = build_valarm_strings ();
+        if (valarms != "") {
+            vtodo_string = vtodo_string.replace ("END:VTODO", valarms + "END:VTODO");
+        }
+
+        var result = "%s%s%s".printf (
             "BEGIN:VCALENDAR\nVERSION:2.0\nPRODID:-//Planify App (https://github.com/alainm23/planify)\n",
-            ical.as_ical_string (),
+            vtodo_string,
             "END:VCALENDAR\n"
         );
+
+        return result;
+    }
+
+    private string build_valarm_strings () {
+        var sb = new StringBuilder ();
+        foreach (var reminder in reminders) {
+            var dt = reminder.datetime;
+            if (dt == null) continue;
+            var utc = dt.to_utc ();
+            string trigger = utc.format ("%Y%m%dT%H%M%SZ");
+            sb.append ("BEGIN:VALARM\n");
+            sb.append ("TRIGGER;VALUE=DATE-TIME:%s\n".printf (trigger));
+            sb.append ("ACTION:DISPLAY\n");
+            sb.append ("DESCRIPTION:%s\n".printf (content));
+            sb.append ("END:VALARM\n");
+        }
+        return sb.str;
     }
 
     public Objects.Item add_item_if_not_exists (Objects.Item new_item, bool insert = true) {
@@ -1723,7 +1814,23 @@ public class Objects.Item : Objects.BaseObject {
     }
 
     public async GLib.DateTime? update_next_recurrency () {
-        var next_recurrency = Utils.Datetime.next_recurrency (due.datetime, due);
+        GLib.DateTime base_datetime = due.datetime;
+
+        if (due.recurrency_from_completion) {
+            // Repeat from the completion date: anchor the next occurrence to today,
+            // keeping the original due time-of-day so a task due at 09:00 stays at 09:00.
+            var now = new GLib.DateTime.now_local ();
+            base_datetime = new GLib.DateTime.local (
+                now.get_year (),
+                now.get_month (),
+                now.get_day_of_month (),
+                due.datetime.get_hour (),
+                due.datetime.get_minute (),
+                due.datetime.get_second ()
+            );
+        }
+
+        var next_recurrency = Utils.Datetime.next_recurrency (base_datetime, due);
         due.date = Utils.Datetime.get_todoist_datetime_format (next_recurrency);
 
         if (due.end_type == RecurrencyEndType.AFTER) {
@@ -1997,6 +2104,10 @@ public class Objects.Item : Objects.BaseObject {
         } else {
             reminder.id = Util.get_default ().generate_id (reminder);
             add_reminder_if_not_exists (reminder);
+
+            if (project.source_type == SourceType.CALDAV && !project.is_deck) {
+                update_async ();
+            }
         }
     }
 
